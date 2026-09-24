@@ -1,0 +1,15 @@
+property,method,class_id,class,min,max,unit,interpretation,source
+ph,H2O,1,Extremely acid,,4.5,pH units,Aluminium toxicity likely and severe P fixation; liming essential for most crops,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+ph,H2O,2,Very strongly acid,4.5,5.1,pH units,Aluminium toxicity likely and P poorly available; liming strongly advised,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+ph,H2O,3,Strongly acid,5.1,5.6,pH units,Aluminium toxicity possible for sensitive crops; liming advised for maize and beans,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+ph,H2O,4,Moderately acid,5.6,6.1,pH units,Suitable for most crops; monitor and lime only for sensitive crops,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+ph,H2O,5,Slightly acid,6.1,6.6,pH units,Near-optimal nutrient availability for most crops,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+ph,H2O,6,Neutral,6.6,7.4,pH units,Optimal for most crops,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+ph,H2O,7,Slightly alkaline,7.4,7.9,pH units,P Zn and Fe availability starts to decline,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+ph,H2O,8,Alkaline,7.9,,pH units,Micronutrient deficiencies likely; check salinity and sodicity,USDA Soil Survey Manual (Soil Science Division Staff 2017)
+soc_gkg,any,1,Extremely low,,4,g/kg,Very poor structure and water and nutrient retention; organic inputs a priority,Hazelton & Murphy (2016) Interpreting Soil Test Results
+soc_gkg,any,2,Very low,4,6,g/kg,Poor fertility buffering; manure compost and residue retention advised,Hazelton & Murphy (2016) Interpreting Soil Test Results
+soc_gkg,any,3,Low,6,10,g/kg,Below desirable levels; integrated organic plus mineral fertilizer advised,Hazelton & Murphy (2016) Interpreting Soil Test Results
+soc_gkg,any,4,Moderate,10,18,g/kg,Adequate; maintain with residue retention and organic inputs,Hazelton & Murphy (2016) Interpreting Soil Test Results
+soc_gkg,any,5,High,18,30,g/kg,Good; maintain current practices,Hazelton & Murphy (2016) Interpreting Soil Test Results
+soc_gkg,any,6,Very high,30,,g/kg,Typical of forest or high-altitude soils; protect from conversion and erosion,Hazelton & Murphy (2016) Interpreting Soil Test Results
