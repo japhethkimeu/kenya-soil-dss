@@ -11,7 +11,8 @@ Outputs
   outputs/model/<prop>_cv_predictions.csv
   outputs/model/<prop>_importance.csv
   outputs/model/<prop>_cv_plot.png        observed vs predicted
-  outputs/maps/<prop>_0_30cm.tif          6 bands: q05, q50, q95, pi90_width, di, aoa
+  outputs/maps/<prop>_0_30cm.tif          8 bands: q05, q25, q50, q75, q95,
+                                          pi90_width, di, aoa
   outputs/maps/<prop>_0_30cm.png          quick-look map
 
 Run from the repo root:  python scripts/03_model_predict.py   (or %run in Colab/Jupyter)
@@ -44,7 +45,10 @@ NODATA = -9999
 
 BLOCK_M = 10_000       # spatial CV block size; larger than the Trans Nzoia clusters
 N_FOLDS = 5
-QUANTILES = [0.05, 0.5, 0.95]
+QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
+QNAMES = ["q05", "q25", "q50", "q75", "q95"]
+BAND_NAMES = QNAMES + ["pi90_width", "di", "aoa"]
+NB = len(BAND_NAMES)
 RF = dict(n_estimators=500, min_samples_leaf=3, max_features=0.33,
           random_state=42, n_jobs=-1)
 ROW_CHUNK = 128        # raster rows predicted at a time (lower if memory is tight)
@@ -109,7 +113,7 @@ def qrf():
 
 
 def metrics(obs, q):
-    lo, med, hi = q[:, 0], q[:, 1], q[:, 2]
+    lo, q25, med, q75, hi = (q[:, i] for i in range(5))
     err = med - obs
     r = np.corrcoef(obs, med)[0, 1]
     ccc = (2 * r * obs.std() * med.std() /
@@ -117,7 +121,8 @@ def metrics(obs, q):
     return {"n": len(obs), "ME": err.mean(), "RMSE": np.sqrt((err ** 2).mean()),
             "MAE": np.abs(err).mean(),
             "R2_MEC": 1 - (err ** 2).sum() / ((obs - obs.mean()) ** 2).sum(),
-            "CCC": ccc, "PICP90": ((obs >= lo) & (obs <= hi)).mean()}
+            "CCC": ccc, "PICP90": ((obs >= lo) & (obs <= hi)).mean(),
+            "PICP50": ((obs >= q25) & (obs <= q75)).mean()}
 
 
 def cross_validate(X, y, splitter, groups=None):
@@ -173,14 +178,14 @@ for prop, label in PROPS.items():
                                            if isinstance(v, float)))
 
     out = d[["site_id", "county", "lon", "lat", prop]].copy()
-    out[["q05", "q50", "q95"]] = oof_sp
+    out[QNAMES] = oof_sp
     out.to_csv(OUT_M / f"{prop}_cv_predictions.csv", index=False)
 
     # observed vs predicted plot (spatial CV)
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
     for county, g in out.groupby("county"):
         ax.scatter(g[prop], g.q50, s=12, alpha=0.7, label=county)
-    lims = [min(y.min(), oof_sp[:, 1].min()), max(y.max(), oof_sp[:, 1].max())]
+    lims = [min(y.min(), oof_sp[:, 2].min()), max(y.max(), oof_sp[:, 2].max())]
     ax.plot(lims, lims, "k--", lw=1)
     ms = [s for s in summary if s["property"] == prop and s["cv"] == "spatial"][0]
     ax.set_title(f"{label} - spatial CV\nR² {ms['R2_MEC']:.2f}  RMSE {ms['RMSE']:.2f}  "
@@ -203,31 +208,32 @@ for prop, label in PROPS.items():
     # ---- predict the raster
     out_path = OUT_MAPS / f"{prop}_0_30cm.tif"
     prof = profile.copy()
-    prof.update(count=6, dtype="float32", nodata=NODATA, compress="deflate",
+    prof.update(count=NB, dtype="float32", nodata=NODATA, compress="deflate",
                 tiled=True, blockxsize=256, blockysize=256, BIGTIFF="IF_SAFER")
     with rasterio.open(COV) as src, rasterio.open(out_path, "w", **prof) as dst:
         for row in range(0, src.height, ROW_CHUNK):
             win = Window(0, row, src.width, min(ROW_CHUNK, src.height - row))
             arr = src.read(window=win).reshape(src.count, -1).T.astype("float64")
             ok = ~(arr == NODATA).any(axis=1) & np.isfinite(arr).all(axis=1)
-            res = np.full((arr.shape[0], 6), NODATA, dtype="float32")
+            res = np.full((arr.shape[0], NB), NODATA, dtype="float32")
             if ok.any():
                 p = model.predict(arr[ok], quantiles=QUANTILES)
                 di = aoa.di(arr[ok])
-                res[ok, :3] = p
-                res[ok, 3] = p[:, 2] - p[:, 0]
-                res[ok, 4] = di
-                res[ok, 5] = (di <= aoa.threshold).astype("float32")
-            dst.write(res.T.reshape(6, win.height, win.width), window=win)
+                res[ok, :5] = p
+                res[ok, 5] = p[:, 4] - p[:, 0]
+                res[ok, 6] = di
+                res[ok, 7] = (di <= aoa.threshold).astype("float32")
+            dst.write(res.T.reshape(NB, win.height, win.width), window=win)
             print(f"\r  predicting rows {row + win.height}/{src.height}", end="")
-        dst.descriptions = ("q05", "q50", "q95", "pi90_width", "di", "aoa")
+        dst.descriptions = tuple(BAND_NAMES)
     print(f"\n  -> {out_path}")
 
     # ---- quick-look map
     with rasterio.open(out_path) as r:
-        med = np.ma.masked_equal(r.read(2), NODATA)
-        width = np.ma.masked_equal(r.read(4), NODATA)
-        aoa_b = np.ma.masked_equal(r.read(6), NODATA)
+        b = {n: i + 1 for i, n in enumerate(BAND_NAMES)}
+        med = np.ma.masked_equal(r.read(b["q50"]), NODATA)
+        width = np.ma.masked_equal(r.read(b["pi90_width"]), NODATA)
+        aoa_b = np.ma.masked_equal(r.read(b["aoa"]), NODATA)
         ext = [r.bounds.left, r.bounds.right, r.bounds.bottom, r.bounds.top]
     fig, axes = plt.subplots(1, 3, figsize=(17, 6), constrained_layout=True)
     panels = [(med, f"{label} - median prediction", "RdYlBu" if prop == "ph" else "YlOrBr"),
