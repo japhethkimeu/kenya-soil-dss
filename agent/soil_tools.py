@@ -52,12 +52,17 @@ ALIASES = {
     "soil organic carbon": "soc_gkg", "carbon": "soc_gkg", "organic matter": "soc_gkg",
 }
 CONFIDENCE = {1: "high", 2: "medium", 3: "low"}
+INTERPRETATION_SOURCE = "project indicator table (config/indicator_thresholds.csv)"
+SIGNIFICANT_PCT = 25   # other classes covering at least this % of an area are reported
 
 
 # ------------------------------------------------------------------ helpers
 def _thresholds(prop):
     t = pd.read_csv(THRESHOLDS)
-    t = t[(t.property == prop) & (t.method == PROPERTIES[prop]["method"])]
+    t = t[(t.property == prop) & (t.method == PROPERTIES[prop]["method"])].copy()
+    # Text the agent inserts never ends with a full stop: the agent always adds it
+    for col in ("interpretation", "explanation"):
+        t[col] = t[col].astype(str).str.strip().str.rstrip(".").str.strip()
     return t.sort_values("class_id").set_index("class_id")
 
 
@@ -85,6 +90,27 @@ def _to_rowcol(ds, lat, lon):
     return row, col, x, y, inside
 
 
+# Text fields the agent is meant to insert into its answer. Every tool result
+# registers them here so the final-answer checks can verify each inserted field
+# is followed by exactly one full stop.
+INSERTABLE_KEYS = ("summary", "advice_text", "interpretation", "explanation",
+                   "dominant_class_interpretation", "dominant_class_explanation")
+INSERTED_TEXTS = set()
+
+
+def _register(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in INSERTABLE_KEYS and isinstance(v, str) and len(v) > 15:
+                INSERTED_TEXTS.add(v)
+            else:
+                _register(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _register(v)
+    return obj
+
+
 def _clean(obj):
     """Convert numpy scalars/arrays inside nested dicts/lists to plain Python types."""
     if isinstance(obj, dict):
@@ -94,6 +120,12 @@ def _clean(obj):
     if isinstance(obj, np.generic):
         return obj.item()
     return obj
+
+
+def _advice_text(items):
+    """Join advice items into one paragraph. Like every inserted text field, it
+    has no final full stop: the agent adds it after inserting the text."""
+    return ". ".join(it.strip().rstrip(".") for it in items if it.strip())
 
 
 def _resolve(name):
@@ -130,19 +162,28 @@ def _point_query(lat, lon):
         in_aoa = bool(mv["aoa"] == 1)
         others = [c for c in possible if c != cls["class"]]
         if conf == "high" or not others:
-            cls_text = f"{cls['class']} (high confidence)"
+            cls_text = f"{cls['class'].lower()} (high confidence)"
         elif conf == "medium":
-            cls_text = f"{cls['class']}, possibly {others[0].lower()} (medium confidence)"
+            cls_text = (f"{cls['class'].lower()}, possibly {others[0].lower()} "
+                        f"(medium confidence)")
         else:
-            cls_text = (f"{cls['class']}; could be anywhere between {possible[0].lower()} "
-                        f"and {possible[-1].lower()} (low confidence)")
-        aoa_text = ("inside the area well represented by the sampled sites" if in_aoa else
-                    "OUTSIDE the area well represented by the sampled sites, "
+            cls_text = (f"{cls['class'].lower()}, but it could be anywhere between "
+                        f"{possible[0].lower()} and {possible[-1].lower()} (low confidence)")
+        aoa_text = ("the location is well represented by the sampled sites" if in_aoa else
+                    "the location is NOT well represented by the sampled sites, "
                     "so this estimate is less reliable")
-        summary = (f"{cfg['label']}: {mv['q50']:.{d}f} {cls.unit} - {cls_text}; "
-                   f"likely range {mv['q25']:.{d}f}-{mv['q75']:.{d}f} {cls.unit}; {aoa_text}.")
+        # No label and no final full stop, so it reads well inside any sentence
+        summary = (f"{mv['q50']:.{d}f} {cls.unit}, {cls_text}, likely between "
+                   f"{mv['q25']:.{d}f} and {mv['q75']:.{d}f} {cls.unit}; {aoa_text}")
+        advice = [f"{cls['class']}: {cls.interpretation}"]
+        for oc in others:
+            orow = thr[thr["class"] == oc].iloc[0]
+            if orow.interpretation != cls.interpretation:
+                advice.append(f"If it is {oc.lower()} instead: {orow.interpretation}")
         result["properties"][prop] = {
             "summary": summary,
+            "advice": advice,
+            "advice_text": _advice_text(advice),
             "label": cfg["label"],
             "unit": cls.unit,
             "predicted_value": round(mv["q50"], d),
@@ -155,7 +196,8 @@ def _point_query(lat, lon):
             "inside_area_of_applicability": in_aoa,
             "interpretation": cls.interpretation,
             "explanation": cls.explanation,
-            "threshold_source": cls.source,
+            "class_ranges_source": cls.source,
+            "interpretation_source": INTERPRETATION_SOURCE,
         }
     if not result["properties"]:
         result["error"] = "No soil maps found. Run steps 3 and 4 first."
@@ -205,15 +247,32 @@ def _area_summary(lat, lon, radius_km):
                     for k, v in CONFIDENCE.items()}
         aoa_pct = round(100 * float((aoa[valid] == 1).mean()), 1)
         dom = thr[thr["class"] == dist_cls[0]["class"]].iloc[0]
-        dist_text = ", ".join(f"{c['class'].lower()} {c['percent_of_area']:.0f}%"
-                              for c in dist_cls)
-        conf_text = ", ".join(f"{v:.0f}% {k}" for k, v in conf_pct.items() if v >= 0.5)
-        summary = (f"{cfg['label']} within {radius_km:g} km: mean "
-                   f"{float(q50[valid].mean()):.{d}f} {thr.unit.iloc[0]}; area by class: "
-                   f"{dist_text}; confidence: {conf_text} of the area; "
-                   f"{aoa_pct:.0f}% of the area is well represented by the sampled sites.")
+        dist_text = " and ".join(f"{c['class'].lower()} on {c['percent_of_area']:.0f}%"
+                                 for c in dist_cls)
+        conf_text = ", ".join(f"{k} on {v:.0f}%" for k, v in conf_pct.items() if v >= 0.5)
+        # No label and no final full stop, so it reads well inside any sentence
+        summary = (f"a mean of {float(q50[valid].mean()):.{d}f} {thr.unit.iloc[0]} "
+                   f"within {radius_km:g} km, {dist_text} of the area; confidence is "
+                   f"{conf_text} of the area, and {aoa_pct:.0f}% of the area is well "
+                   f"represented by the sampled sites")
+        # Other classes covering a significant share of the area get their own advice
+        others = []
+        for c in dist_cls[1:]:
+            if c["percent_of_area"] >= SIGNIFICANT_PCT:
+                row = thr[thr["class"] == c["class"]].iloc[0]
+                others.append({"class": c["class"],
+                               "percent_of_area": c["percent_of_area"],
+                               "interpretation": row.interpretation,
+                               "explanation": row.explanation})
+        # One advice sentence per significant class, with its share of the area
+        advice = [f"On {dist_cls[0]['percent_of_area']:.0f}% of the area "
+                  f"({dist_cls[0]['class'].lower()}): {dom.interpretation}"]
+        advice += [f"On {o['percent_of_area']:.0f}% of the area ({o['class'].lower()}): "
+                   f"{o['interpretation']}" for o in others]
         result["properties"][prop] = {
             "summary": summary,
+            "advice": advice,
+            "advice_text": _advice_text(advice),
             "label": cfg["label"],
             "unit": thr.unit.iloc[0],
             "mapped_area_km2": round(n * px * px / 1e6, 1),
@@ -223,17 +282,19 @@ def _area_summary(lat, lon, radius_km):
             "dominant_class": dist_cls[0]["class"],
             "dominant_class_interpretation": dom.interpretation,
             "dominant_class_explanation": dom.explanation,
+            "other_significant_classes": others,
             "class_distribution": dist_cls,
             "confidence_percent": conf_pct,
             "percent_inside_area_of_applicability": aoa_pct,
-            "threshold_source": dom.source,
+            "class_ranges_source": dom.source,
+            "interpretation_source": INTERPRETATION_SOURCE,
         }
     if not result["properties"]:
         result["error"] = "No soil maps found. Run steps 3 and 4 first."
     return result
 
 
-def _class_table(property_name):
+def _class_table(property_name, class_name=None):
     props = _available() if str(property_name).lower() == "all" else [_resolve(property_name)]
     if props == [None]:
         return {"error": f"Unknown property '{property_name}'. "
@@ -241,12 +302,27 @@ def _class_table(property_name):
     out = {}
     for p in props:
         thr = _thresholds(p)
+        rows = thr
+        if class_name:
+            key = str(class_name).strip().lower()
+            rows = thr[thr["class"].str.lower() == key]
+            if rows.empty:
+                rows = thr[thr["class"].str.lower().str.contains(key, regex=False)]
+            if rows.empty:
+                out[p] = {"error": f"No class '{class_name}' for {p}. Classes: "
+                                   f"{', '.join(thr['class'])}"}
+                continue
         out[p] = {"label": PROPERTIES[p]["label"],
-                  "source": thr.source.iloc[0],
+                  "class_ranges_source": thr.source.iloc[0],
+                  "interpretation_source": INTERPRETATION_SOURCE,
                   "classes": [{"class": r["class"], "range": _range_text(r),
+                               "summary": (f"{PROPERTIES[p]['label']} values of "
+                                           f"{_range_text(r)} count as "
+                                           f"{r['class'].lower()}"),
+                               "advice_text": r.interpretation,
                                "interpretation": r.interpretation,
                                "explanation": r.explanation}
-                              for _, r in thr.iterrows()]}
+                              for _, r in rows.iterrows()]}
     return out
 
 
@@ -294,7 +370,11 @@ def get_soil_at_location(lat: float, lon: float) -> dict:
     Returns a dict:
         {"location": {"lat": <float>, "lon": <float>}, "depth": "0-30 cm",
          "properties": {
-            "ph": {"summary": <ready-to-use sentence: value, class, confidence, AOA>,
+            "ph": {"summary": <sentence fragment (no label, no final full stop): value,
+                               class, confidence, likely range, AOA>,
+                   "advice": [<str>, ...]   (advice for the class, plus for other possible
+                               classes when it differs),
+                   "advice_text": <the advice joined into one paragraph, no final full stop>,
                    "label": <str>, "unit": <str>,
                    "predicted_value": <float>,
                    "likely_range_50pct": [<float>, <float>],
@@ -305,16 +385,19 @@ def get_soil_at_location(lat: float, lon: float) -> dict:
                    "inside_area_of_applicability": <bool>,
                    "interpretation": <management meaning of the class>,
                    "explanation": <why the class matters for crops>,
-                   "threshold_source": <str>},
+                   "class_ranges_source": <source of the class thresholds only>,
+                   "interpretation_source": <source of interpretation/explanation/advice>},
             "soc_gkg": {...same keys...}}}
-    Use the "summary" field to report each property. If a property has a "status"
+    Use "summary" to report each property and "advice_text" for recommendations.
+    No inserted text field (summary, advice_text, interpretation, explanation) ends
+    with a full stop: add exactly one after inserting it. If a property has a "status"
     key instead (e.g. "outside the mapped area"), there is no data there.
 
     Args:
         lat: Latitude in decimal degrees (WGS84), e.g. 0.28.
         lon: Longitude in decimal degrees (WGS84), e.g. 34.75.
     """
-    return _clean(_point_query(lat, lon))
+    return _register(_clean(_point_query(lat, lon)))
 
 
 @tool
@@ -326,24 +409,35 @@ def summarize_area(lat: float, lon: float, radius_km: float) -> dict:
     Returns a dict:
         {"center": {"lat": <float>, "lon": <float>}, "radius_km": <float>, "depth": "0-30 cm",
          "properties": {
-            "ph": {"summary": <ready-to-use sentence: mean, % of area per class,
-                               confidence mix, % inside area of applicability>,
+            "ph": {"summary": <sentence fragment (no label, no final full stop): mean,
+                               % of area per class, confidence mix, % of area well
+                               represented by the sampled sites>,
+                   "advice": [<str>, ...]   (one sentence per significant class, each
+                               starting "On <percent>% of the area (<class>): ..."),
+                   "advice_text": <the advice joined into one paragraph, no final full stop>,
                    "label": <str>, "unit": <str>,
                    "mapped_area_km2": <float>, "mean_value": <float>,
                    "min_max_value": [<float>, <float>],
                    "dominant_class": <str>,
                    "dominant_class_interpretation": <management meaning>,
                    "dominant_class_explanation": <why it matters for crops>,
+                   "other_significant_classes": [{"class": <str>,
+                        "percent_of_area": <float 0-100>, "interpretation": <str>,
+                        "explanation": <str>}, ...]   (other classes covering 25% or
+                        more of the area; empty list if none),
                    "class_distribution": [{"class": <str>, "class_range": <str>,
                                            "percent_of_area": <float 0-100>}, ...],
                    "confidence_percent": {"high": <float 0-100>, "medium": <float 0-100>,
                                           "low": <float 0-100>},
                    "percent_inside_area_of_applicability": <float 0-100>,
-                   "threshold_source": <str>},
+                   "class_ranges_source": <source of the class thresholds only>,
+                   "interpretation_source": <source of interpretation/explanation/advice>},
             "soc_gkg": {...same keys...}}}
     All percentages are ALREADY 0-100: never multiply them by 100.
     Area results have no "class", "possible_classes" or "confidence" keys.
-    Use the "summary" field to report each property.
+    Use "summary" to report each property and "advice_text" for recommendations.
+    No inserted text field (summary, advice_text, interpretation, explanation) ends
+    with a full stop: add exactly one after inserting it.
 
     Args:
         lat: Latitude of the area centre in decimal degrees (WGS84).
@@ -351,26 +445,34 @@ def summarize_area(lat: float, lon: float, radius_km: float) -> dict:
         radius_km: Radius in kilometres (0.5 to 50). Use 3 km for a town or village
             and its surroundings unless the user gives a radius.
     """
-    return _clean(_area_summary(lat, lon, radius_km))
+    return _register(_clean(_area_summary(lat, lon, radius_km)))
 
 
 @tool
-def get_class_definitions(property_name: str) -> dict:
+def get_class_definitions(property_name: str, class_name: str | None = None) -> dict:
     """Get the class thresholds used to interpret a soil property: each class with its
     value range, management interpretation, explanation of why it matters for crops,
     and the source of the thresholds. Use this for questions about what a class or
     value means, or why it matters.
 
     Returns a dict keyed by property:
-        {"ph": {"label": <str>, "source": <str>,
+        {"ph": {"label": <str>, "class_ranges_source": <source of the class ranges>,
+                "interpretation_source": <source of interpretation/explanation>,
                 "classes": [{"class": <str>, "range": <str>,
+                             "summary": <fragment: "<label> values of <range> count as <class>">,
+                             "advice_text": <what to do (same as interpretation)>,
                              "interpretation": <str>, "explanation": <str>}, ...]}}
-    Find a class by looping over result["ph"]["classes"].
+    Like point and area results, each class has "summary" and "advice_text"; none
+    of the text fields ends with a full stop.
+    With class_name given, "classes" holds only that class (matching ignores case),
+    so use result["ph"]["classes"][0].
 
     Args:
         property_name: 'ph', 'soc' (soil organic carbon), or 'all' for every property.
+        class_name: Optional class to return, e.g. "strongly acid" (case-insensitive).
+            Leave out to get all classes.
     """
-    return _clean(_class_table(property_name))
+    return _register(_clean(_class_table(property_name, class_name)))
 
 
 TOOLS = [find_place, get_soil_at_location, summarize_area, get_class_definitions]
