@@ -1,62 +1,92 @@
-# Kenya Soil DSS (prototype)
+# Kenya Soil DSS – Soil Advisor (prototype)
 
-Workflow for mapping soil properties from point data and (later) serving them
-through an AI agent that supports agricultural planning in Kenya.
+[![Open the Soil Advisor](https://img.shields.io/badge/%F0%9F%A4%97%20Open%20the%20app-Kenya%20Soil%20Advisor-yellow)](https://huggingface.co/spaces/kimeujapheth/kenya-soil-advisor)
 
-This prototype uses legacy GloSIS-harmonized data for **Kakamega and Trans Nzoia**
-(pH and SOC, 0-30 cm) to build and test the workflow. The legacy data is a
-placeholder: the workflow is designed so that new soil testing data can be
-plugged in and the system scaled to more counties and properties.
+A prototype decision-support system that maps soil properties from soil data and
+serves them through an **AI agent** that answers questions and gives management
+recommendations, as a basis for agricultural planning in Kenya.
 
-## Workflow
+**Try it:** [Kenya Soil Advisor on Hugging Face](https://huggingface.co/spaces/kimeujapheth/kenya-soil-advisor)
+– sign in with a free Hugging Face account and ask, for example,
+*"Should a farmer near Kakamega town apply lime?"* or
+*"Summarize soil conditions within 5 km of Malava."*
 
-| Step | File | Runs in | Output |
-|---|---|---|---|
-| 1. Point table | `scripts/01_build_point_table.py` | Colab / Python | `data/points_ph_soc_kakamega_transnzoia.csv`, point map |
-| 2. Covariates | `gee/02_covariates_gee.js` | GEE Code Editor | 30-band covariate GeoTIFF (100 m, UTM 36N) + band list CSV, exported to Drive |
-| 3. Model + prediction | `scripts/03_model_predict.py` | Colab / Python | QRF prediction rasters (q05, q50, q95, PI width, DI, AOA), CV metrics, quick-look maps |
+> **Prototype.** Current maps cover **Kakamega and Trans Nzoia** counties
+> (soil pH and soil organic carbon, 0–30 cm) and are modelled from legacy soil data.
+> Not a substitute for a soil test or local extension advice; no lime or fertilizer
+> rates are given.
 
-Planned: 4. indicators (threshold classes), 5. agent tools,
-6. smolagents agent, 7. config-driven scaling to new data and counties.
-
-## Data (not in this repo)
-
-Data and outputs are excluded by `.gitignore`. Place files as follows:
+## How it works
 
 ```
-data/raw/          Kakamega_KCEP_AGRA_GloSIS_harmonized.xlsx
-                   TransNzoia_KCEP_GloSIS_harmonized.xlsx
-data/covariates/   cov_kak_tnz_100m*.tif          (GEE export)
-                   cov_kak_tnz_100m_bands.csv     (GEE export)
+soil data ─▶ covariates (GEE) ─▶ Quantile Regression Forest ─▶ prediction + uncertainty maps
+                                                                     │
+                                         indicator classes ◀─────────┘
+                                                │
+             question ─▶ smolagents CodeAgent ─▶ tools (maps + classes) ─▶ checked answer
 ```
 
-## How to run
+| Step | What | File |
+|---|---|---|
+| 1 | Point table: topsoil pH and SOC per site | `scripts/01_build_point_table.py` |
+| 2 | Covariates: terrain, climate, Sentinel-2 (100 m) | `scripts/02_covariates_gee.js` (GEE Code Editor) |
+| 3 | Quantile Regression Forest, spatial CV, prediction (q05–q95), Area of Applicability | `scripts/03_model_predict.py` |
+| 4 | Indicator classes and class confidence | `scripts/04_indicators.py`, `config/indicator_thresholds.csv` |
+| 5 | Agent tools and smolagents CodeAgent with final-answer checks | `agent/soil_tools.py`, `agent/soil_agent.py` |
+| 6 | Gradio app (Hugging Face Space, sign-in with Hugging Face) | `space/app.py`, `space/deploy_space.py` |
 
-**Step 2 (GEE):** paste `gee/02_covariates_gee.js` into the Code Editor, run it,
-then start both exports in the Tasks tab and download them from Drive
-(`soil_dss_covariates` folder) to `data/covariates/`.
+Notebooks: `notebooks/Quantile_Regression_Forest.ipynb` (steps 1, 3, 4) and
+`notebooks/SoilAgent.ipynb` (agent, tests, deployment), written for Google Colab.
 
-**Steps 1 and 3 (Colab):** put this repo folder in Google Drive, open
-`notebooks/colab_run.ipynb` in Colab, set `REPO` in the first cell and run all cells.
+## The agent
 
-Locally, from the repo root:
+- **Framework:** [smolagents](https://github.com/huggingface/smolagents) `CodeAgent`,
+  model `Qwen/Qwen2.5-Coder-32B-Instruct` via Hugging Face Inference.
+- **Tools:** `find_place` (OpenStreetMap), `get_soil_at_location`, `summarize_area`,
+  `get_class_definitions`. Tools return ready-made summaries and advice, so numbers
+  and recommendations come from the maps and the indicator table, not from the model.
+- **Grounding:** every answer reports value, class, confidence and how well the area is
+  represented by the sampled sites (Area of Applicability); recommendations come only
+  from `config/indicator_thresholds.csv`.
+- **Final-answer checks:** code checks reject answers with retyped numbers, sources
+  attributed to recommendations, broken punctuation, or (for management questions)
+  a missing property; the agent then rewrites its answer.
+
+## Running it
 
 ```bash
-pip install -r requirements.txt
-python scripts/01_build_point_table.py
-python scripts/03_model_predict.py
+pip install -r requirements.txt smolagents
+python scripts/01_build_point_table.py      # needs the source workbooks in data/raw/
+python scripts/03_model_predict.py          # needs covariates in data/covariates/
+python scripts/04_indicators.py
 ```
 
-## Methods (short)
+Then in Python:
 
-- Topsoil values (0-30 cm) per site; sites with several specimens are averaged.
-- Covariates: terrain (NASADEM, MERIT Hydro), climate (CHIRPS, WorldClim,
-  TerraClimate, MODIS LST), Sentinel-2 all-year and dry-season composites.
-- Model: Quantile Regression Forest; spatial block cross-validation (10 km).
-- Outputs include prediction intervals and an Area of Applicability
-  (Meyer & Pebesma 2021) so downstream tools can flag weak predictions.
+```python
+from agent.soil_agent import build_agent
+agent = build_agent(token="<your Hugging Face token>")
+agent.run("What is the soil pH around Kitale, and does it need liming?")
+```
 
-## Status
+Deploy the app: `python space/deploy_space.py --space <hf-username>/kenya-soil-advisor`
+(needs a Hugging Face write token in `HF_WRITE_TOKEN`).
 
-Prototype under the FAO SoilFER project. Private - do not share data or outputs
-without clearance.
+## Data
+
+Source soil data and covariates are not included in this repository. The app uses
+only modelled prediction layers (no point observations).
+
+## Status and roadmap
+
+- Scale to national soil testing data and more counties and properties
+- Crop suitability and nutrient indicators
+- Expose the tools through MCP
+
+## Author
+
+**Japheth Kimeu** · [japhethkimeu.github.io](https://japhethkimeu.github.io)
+
+## Licence
+
+Code released under the [MIT Licence](LICENSE).
